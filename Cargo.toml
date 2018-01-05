@@ -1,0 +1,19 @@
+[package]
+name = "recode"
+version = "0.1.0"
+authors = ["Austin Jones <austinbaysjones@gmail.com>"]
+
+[dependencies]
+pkg-config = "0.3.9"
+gstreamer = "0.10.0"
+gstreamer-app = "0.10.0"
+gstreamer-audio = "0.10.0"
+gstreamer-video = "0.10.0"
+glib = "0.4.0"
+failure = "0.1.1"
+failure_derive = "0.1.1"
+byte-slice-cast = "0.1.0"
+itertools = "0.7.4"
+byteorder = "1.2.1"
+rustfft = "2.0.0"
+num-complex = "0.1.41"
