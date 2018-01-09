@@ -14,4 +14,8 @@ impl<'a> AudioFrame<'a> {
     pub fn sum(&self) -> f64 {
         self.data.iter().fold(0f64, |a,b| a+(*b as f64))
     }
+
+    pub fn abs_sum(&self) -> f64 {
+        self.data.iter().map(|e| e.abs() as f64).fold(0f64, |a,b| a+b)
+    }
 }

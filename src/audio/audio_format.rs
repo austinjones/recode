@@ -24,6 +24,10 @@ impl AudioFormat {
             frame_duration: 1f64 / ((rate as f64) * (channels as f64))
         }
     }
+
+    pub fn frames_in(&self, time: f64) -> usize {
+        (time * (self.rate as f64)).ceil() as usize
+    }
 }
 
 impl AudioFormat {

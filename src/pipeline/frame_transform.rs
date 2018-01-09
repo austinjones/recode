@@ -1,11 +1,11 @@
 use audio::audio_frame::*;
 use video::video_frame::*;
 
+use measures::*;
 
-use rustfft::num_complex::*;
-use rustfft::num_traits::Zero;
-use rustfft::FFTplanner;
-use rustfft::FFT;
+use pipeline::measures::*;
+
+
 
 use pipeline::queue_buf::*;
 use std::sync::Arc;
@@ -23,30 +23,21 @@ const ABS_VOL_SIZE: usize = 30*3;
 const ROTATION_RATE: f64 = (1f64 / 10f64);
 
 pub struct FrameTransformImpl {
-    queue_buf: QueueBuf<f64>,
-    baseline_buf: QueueBuf<f64>,
-    disturb_buf: QueueBuf<f64>,
-    abs_vol_buf: QueueBuf<f64>,
-    max_vol: f64,
-    volratio_decay: f64,
-    angle: f64,
-    fft: Arc<FFT<f64>>
+    frame_counter: usize,
+    audio_edge: Option<NormalizedAudioEdgeMeasure>,
+    audio_volume: Option<NormalizedAudioVolumeMeasure>,
+    fft: Option<FFTMeasure>,
+    angle: f64
 }
 
 impl FrameTransformImpl {
     pub fn new() -> FrameTransformImpl{ 
-        
-        let mut planner = FFTplanner::new(false);
-
         FrameTransformImpl {
-            queue_buf: QueueBuf::new(vec!(0f64; AUDIO_SIZE)),
-            baseline_buf: QueueBuf::new(vec!(0f64; BASELINE_SIZE)),
-            disturb_buf: QueueBuf::new(vec!(0f64; DISTURB_SIZE)),
-            abs_vol_buf: QueueBuf::new(vec!(0f64; ABS_VOL_SIZE)),
-            max_vol: 0f64,
-            volratio_decay: 0f64,
-            angle: 0f64,
-            fft: planner.plan_fft(AUDIO_SIZE)
+            frame_counter: 0,
+            audio_edge: None,
+            audio_volume: None,
+            fft: None,
+            angle: 0f64
         }
     }
 
@@ -128,31 +119,50 @@ impl FrameTransformImpl {
 
 impl FrameTransform for FrameTransformImpl {
     fn process_audio_frame(&mut self, aframe: &mut AudioFrame, atime: f64) {
-        let sum = aframe.sum();
-        self.queue_buf.push(sum);
-        self.baseline_buf.push(sum);
+        // if self.frame_counter < 50 {
+        //     self.frame_counter += 1;
+        //     return;
+        // } else {
+        //     self.frame_counter = 0;
+        // }
+        if aframe.sum() == 0f64 {
+            return;
+        }
+
+        if self.audio_edge.is_none() {
+            self.audio_edge = Some(NormalizedAudioEdgeMeasure::new(&aframe.format));
+        }
+
+        if self.audio_volume.is_none() {
+            self.audio_volume = Some(NormalizedAudioVolumeMeasure::new(&aframe.format));
+        }
+
+        if self.fft.is_none() {
+            self.fft = Some(FFTMeasure::new(&aframe.format, 256));
+        }
+
+        self.audio_edge.as_mut().unwrap().update(aframe);
+        self.audio_volume.as_mut().unwrap().update(aframe);
+        self.fft.as_mut().unwrap().update(aframe);
     }
 
 
     fn process_video_frame(&mut self, vframe: &mut VideoFrame, vtime: f64) {
         // let mut fft_output = vec!(Complex64::zero(); FFT_SIZE);
-        let audio_vec = self.queue_buf.extract();
-        let abs_audio: Vec<f64> = audio_vec.iter().map(|e| e.abs()).collect();
-
-        let baseline_vec = self.baseline_buf.extract();
-        let abs_baseline: Vec<f64> = baseline_vec.iter().map(|e| e.abs()).collect();
-
-        let avg_vol = Self::avg(abs_audio.as_slice());
-        let baseline_vol = Self::avg(abs_baseline.as_slice());
-        if avg_vol > self.max_vol {
-            self.max_vol = avg_vol;
+        let mut abs_vol = self.audio_volume.as_mut().map(|e| e.value(())).unwrap_or(0f64);
+        if abs_vol.is_nan() {
+            abs_vol = 0f64;
         }
 
-        let abs_vol = if self.max_vol > 0f64 { avg_vol / self.max_vol } else { 0f64 };
-        self.abs_vol_buf.push(abs_vol);
-
-        let avg_abs_vol = Self::avg(self.abs_vol_buf.extract().as_slice());
+        let fft: Vec<f64> = self.fft.as_mut().map(|e| e.value()).unwrap_or_else(|| vec!(0f64; 256));
+        
+        let mut disturbance = self.audio_edge.as_mut().map(|e| e.value(())).unwrap_or(0f64);
+        if disturbance.is_nan() {
+            disturbance = 0f64;
+        }
         let raw_rotation = (1f64+3f64*abs_vol) * ROTATION_RATE;
+
+        println!("Time: {:.2}, Abs vol: {:.2}, audio_edge: {:.2}", vtime, abs_vol, disturbance);
         // self.fft.process(audio_vec.as_mut_slice(), fft_output.as_mut_slice());
         // let fft_output: Vec<f64> = fft_output[0..FFT_SIZE/2].iter().map(|e| e.norm_sqr()).collect();
         // let center_of_mass = Self::center_of_mass(fft_output.as_slice());
@@ -164,38 +174,32 @@ impl FrameTransform for FrameTransformImpl {
         // println!("Low: {}, High: {}", low, high);
 
         // let rotation = (vtime % 7f64) / 7f64;
-        println!("Avg vol: {}, Max Vol: {}, vol ratio: {}, avg ratio: {}", avg_vol, self.max_vol, abs_vol, avg_abs_vol);
+        // println!("Avg vol: {}, Max Vol: {}, vol ratio: {}, avg ratio: {}", avg_vol, self.max_vol, abs_vol, avg_abs_vol);
         self.angle += raw_rotation * vframe.format.frame_duration;
 
-        let spike_volratio = if baseline_vol == 0f64 { 1f64 } else { avg_vol/baseline_vol };
-        if spike_volratio > self.volratio_decay {
-            self.volratio_decay = self.volratio_decay + 0.6f64 * (spike_volratio - self.volratio_decay);
-        } else {
-            self.volratio_decay = self.volratio_decay - 0.2f64 * (self.volratio_decay - spike_volratio);
-        }
-
-        let raw_disturb = self.volratio_decay-1f64;
         // self.disturb_buf.push(raw_disturb);
-        let disturbance = Self::sigmoid(2f64*(self.volratio_decay-1f64))-0.5f64;
-        println!("Vol_Decay: {}, disturb: {}", self.volratio_decay, disturbance);
+        // println!("Vol_Decay: {}, disturb: {}", self.volratio_decay, disturbance);
         // let disturbance = Self::avg(self.disturb_buf.extract().as_slice());
         // let disturbance = Self::sigmoid(5f64*disturbance)-0.5f64;
         // let disturbance = Self::sigmoid(5f64*(self.abs_vol_decay - avg_abs_vol))-0.5f64;
-        println!("Rotation: {}, raw disturb: {}, disturbance: {}", raw_rotation, raw_disturb, disturbance);
+        // println!("Rotation: {}, raw disturb: {}, disturbance: {}", raw_rotation, raw_disturb, disturbance);
         // let rotation = Self::sigmoid(15f64 * (high - low))-0.5f64);
 
         
         // println!("Low: {}, High: {}", low, high);
         // println!("Diff: {}, Rotation: {}", (high-low), rotation);
 
-        if self.queue_buf.is_saturated() {
-            // println!("FFT input: {:?}", audio_vec);
-            // println!("FFT output: {:?}", fft_output);
-        }
+        // if self.queue_buf.is_saturated() {
+        //     // println!("FFT input: {:?}", audio_vec);
+        //     // println!("FFT output: {:?}", fft_output);
+        // }
 
         for pixel in vframe.data.chunks_mut(4) {
+            let fft_index = 256 - (pixel[1] as usize);
+            let fft_val = fft.get(fft_index).map(|e| *e).unwrap_or(0f64);
+
             let (u, v) = Self::rotate(pixel[1], pixel[2], pixel[3], 
-                self.angle + (0.45f64 * disturbance), 
+                self.angle + (0.05f64 * disturbance), 
                 1.5f64 + 1.1f64 * disturbance);
             // pixel[2] = pixel[2].wrapping_add(rotation);
             

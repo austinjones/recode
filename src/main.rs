@@ -4,12 +4,17 @@
 mod audio;
 mod pipeline;
 mod video;
+mod measures;
+mod osx;
+
+use std::thread;
 
 use pipeline::pipeline_utils::*;
 use pipeline::frame_source::*;
 use pipeline::frame_sink::*;
 
 use pipeline::frame_transform::*;
+use osx::*;
 
 /////////////
 
@@ -22,7 +27,18 @@ extern crate gstreamer_audio;
 extern crate gstreamer_video;
 extern crate byte_slice_cast;
 extern crate rustfft;
+extern crate apodize;
 extern crate num_complex;
+extern crate stats;
+extern crate glib;
+
+extern crate cpuprofiler;
+
+#[macro_use]
+extern crate serde_derive;
+extern crate docopt;
+
+use docopt::Docopt;
 
 use gstreamer::prelude::*;
 
@@ -30,51 +46,105 @@ use std::env;
 #[cfg(feature = "v1_10")]
 use std::sync::{RwLock, Mutex};
 
-
 extern crate failure;
 use failure::Error;
 
 #[macro_use]
 extern crate failure_derive;
 
+const USAGE: &'static str = "
+Recode.
+
+Usage:
+  recode convert <input-mp4> <output-mp4>
+  recode preview <input-mp4>
+  recode trace <input-mp4> <measure>
+  recode (-h | --help)
+  recode --version
+
+Options:
+  -h --help     Show this screen.
+  --version     Show version.
+";
+
+#[derive(Debug, Deserialize)]
+struct Args {
+    arg_input_mp4: String,
+    arg_output_mp4: String,
+    arg_measure: String,
+    cmd_convert: bool,
+    cmd_preview: bool,
+    cmd_trace: bool
+}
+
+impl Args {
+    fn get_sinktype(&self) -> Option<SinkType> {
+        if self.cmd_preview {
+            Some(SinkType::playback)
+        } else if self.cmd_convert {
+            Some(SinkType::file_mp4(self.arg_output_mp4.clone()))
+        } else {
+            None
+        }
+    }
+}
+
 fn example_main() -> Result<(), Error> {
+    let args: Args = Docopt::new(USAGE)
+                            .and_then(|d| d.deserialize())
+                            .unwrap_or_else(|e| e.exit());
+
     gstreamer::init()?;
 
-    let args: Vec<_> = env::args().collect();
-    let (uri, to): (&str, &str) = if args.len() == 3 {
-        (args[1].as_ref(), args[2].as_ref())
+
+    let sinktype = args.get_sinktype();
+    if sinktype.is_some() {
+        let sinktype = sinktype.unwrap();
+        let uri_from = args.arg_input_mp4.as_str();
+        let uri_to = args.arg_output_mp4.as_str();
+
+        println!("Creating framesource");
+        let mut sink;
+        {
+            let (source, arx, vrx) = FrameSource::new(uri_from)?;
+            println!("Spawning framesink");
+            sink = FrameSink::spawn(sinktype, FrameTransformImpl::new(), arx, vrx);
+            println!("Running source pipeline...");
+            // source.add_video_handler(|frame, timecode| {});
+            // source.add_audio_handler(|sample, timecode| {});
+            PipelineUtils::start(&source)?;
+            PipelineUtils::message(&source)?;
+            PipelineUtils::stop(&source)?;
+        }
+
+        println!("Done!  Waiting for sink pipeline to finish...");
+        sink.join();
     } else {
-        println!("Usage: decodebin file_path");
-        std::process::exit(-1)
-    };
-    
-    println!("Creating framesource");
-    let mut sink;
-    {
-        let (source, arx, vrx) = FrameSource::new(uri, to)?;
-        println!("Spawning framesink");
-        sink = FrameSink::spawn(to, FrameTransformImpl::new(), arx, vrx);
-        println!("Running source pipeline...");
-        // source.add_video_handler(|frame, timecode| {});
-        // source.add_audio_handler(|sample, timecode| {});
-        PipelineUtils::start(&source)?;
-        PipelineUtils::message(&source)?;
-        PipelineUtils::stop(&source)?;
+        println!("Unknown command!");
     }
 
+    
 
-    println!("Done!  Waiting for sink pipeline to finish...");
-    sink.join();
-
+    
     println!("Done!");
     Ok(())
 }
 
 fn main() {
-    match example_main() {
-        Ok(_) => println!("Success!"),
-        Err(e) => println!("Error! {}", e)
-    }
+    let main_loop = glib::MainLoop::new(glib::MainContext::default().as_ref(), false);
+    let main_loop_end = main_loop.clone();
+
+    let join_program = thread::spawn(move || {
+        println!("Running program");
+        match osx::run(example_main) {
+            Ok(_) => println!("Success!"),
+            Err(e) => println!("Error! {}", e)
+        }
+        main_loop_end.quit();
+    });
+
+    main_loop.run();
+    join_program.join();
 }
 
 

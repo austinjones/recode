@@ -23,10 +23,18 @@ use gstreamer_app;
 
 extern crate failure;
 use failure::Error;
+use cpuprofiler::PROFILER;
+
+pub enum SinkType {
+    file_mp4(String),
+    playback
+}
 
 pub struct FrameSink {
     pipeline: gstreamer::Pipeline,
-    sink: gstreamer::Element
+    video_sink: gstreamer::Element,
+    audio_sink: gstreamer::Element,
+    sink_type: SinkType
 }
 
 impl IntoPipeline for FrameSink {
@@ -36,15 +44,14 @@ impl IntoPipeline for FrameSink {
 }
 
 impl FrameSink {
-    pub fn spawn<T: FrameTransform + Send + 'static>(uri: &str, transform: 
+    pub fn spawn<T: FrameTransform + Send + 'static>(stype: SinkType, transform: 
     T, arx: Receiver<Arc<Mutex<AudioBuffer>>>, vrx: Receiver<Arc<Mutex<VideoBuffer>>>) -> ::std::thread::JoinHandle<()> {
         // get an owned string so the &str doesn't need to exist for the static lifetime...
         // we unpack it on the other side
-        let movestr = uri.to_string();
         let mut transform = transform;
 
         thread::spawn(move || {
-            let mut sink = FrameSink::new(movestr.as_str()).unwrap();
+            let mut sink = FrameSink::new(stype).unwrap();
             println!("Got framesink!  Waiting for Audio/Video format");
 
             let mut audio_sink = None;
@@ -90,7 +97,7 @@ impl FrameSink {
                 PipelineUtils::stop(&sink);
             });
             println!("Write pipeline started!");
-
+            // PROFILER.lock().unwrap().start("./my-prof.profile").unwrap();
             while has_video_frame || has_audio_frame {
                 // oh the CPU branch prediction.. poor CPU..
                 // however, since this program is meant to do offline 'one time' processing, 
@@ -128,31 +135,19 @@ impl FrameSink {
                 }
 
                 while let Some(buf) = video_iter.next_finished_buffer() {
-                    println!("Finishing video buffer at time {}", vtime);
+                    // println!("Finishing video buffer at time {}", vtime);
                     // println!("Moving video buffer into appsrc...");
                     buf.into_appsrc(video_sink.as_mut().unwrap());
                     // println!("Done moving video buffer into appsrc...");
                 }
 
                 while let Some(buf) = audio_iter.next_finished_buffer() {
-                    println!("Finishing audio buffer at time {}", atime);
+                    // println!("Finishing audio buffer at time {}", atime);
                     buf.into_appsrc(audio_sink.as_mut().unwrap());
                 }
-                
-                // let audio_frame = audio_iter.next();
-                // if audio_frame.is_none() {
-                //     audio = audio_iter.next();
-                    
-                // }
-                // let video_frame = video_iter.next();
-                // println!("Got video width: {:?}", video.format.width);
-                // identify next video frame
-                // vtime += vf.frame_time;
-                
-                // process audio to that frame
-
-                // process video frame
             }
+
+            // PROFILER.lock().unwrap().stop().unwrap();
             println!("Finished writing frames");
             video_sink.unwrap().end_of_stream();
             audio_sink.unwrap().end_of_stream();
@@ -163,44 +158,75 @@ impl FrameSink {
         })
     }
 
-    pub fn new(uri: &str) -> Result<FrameSink, Error> {
+    pub fn new(sink_type: SinkType) -> Result<FrameSink, Error> {
         let pipeline = gstreamer::Pipeline::new("recode-output");
-        let filesink = gstreamer::ElementFactory::make("filesink", None).ok_or(MissingElement("filesink"))?;
-        filesink.set_property("location", &uri)?;
 
-        pipeline.add_many(&[&filesink])?;
+        let (vid, aud) = match &sink_type {
+            &SinkType::file_mp4(ref uri) => {
+                let filesink = gstreamer::ElementFactory::make("filesink", None).ok_or(MissingElement("filesink"))?;
+                filesink.set_property("location", &uri)?;
 
-        let encoder = gstreamer::ElementFactory::make("mp4mux", None).ok_or(MissingElement("webmmux"))?;
-        encoder.set_property("streamable", &true)?;
-        encoder.connect_pad_added(move |element, src_pad| {
-            element.link(&filesink);
-        });
+                pipeline.add_many(&[&filesink])?;
 
-        pipeline.add_many(&[&encoder])?;
+                let encoder = gstreamer::ElementFactory::make("mp4mux", None).ok_or(MissingElement("webmmux"))?;
+                encoder.set_property("streamable", &true)?;
+                encoder.connect_pad_added(move |element, src_pad| {
+                    element.link(&filesink);
+                });
 
-        let sink = FrameSink {
-            pipeline: pipeline,
-            sink: encoder
+                pipeline.add_many(&[&encoder])?;
+                (encoder.clone(), encoder)
+            },
+            &SinkType::playback => {
+                // let playsink = gstreamer::ElementFactory::make("fakesink", None).ok_or(MissingElement("fakesink"))?;
+                
+                // let playsink = gstreamer::ElementFactory::make("playsink", None).ok_or(MissingElement("playsink"))?;
+                // playsink.set_property_from_str("flags", "soft-colorbalance+soft-volume+text+audio+video+buffer");
+                // let audiosink = gstreamer::ElementFactory::make("autoaudiosink", None).ok_or(MissingElement("autoaudiosink"))?;
+                // let videosink = gstreamer::ElementFactory::make("autovideosink", None).ok_or(MissingElement("autovideosink"))?;
+                
+                // playsink.set_property("audio-sink", &audiosink)?;
+                // playsink.set_property("video-sink", &videosink)?;
+
+                // pipeline.add_many(&[&playsink, &audiosink, &videosink])?;
+                // pipeline.add_many(&[&playsink])?;
+                // playsink
+                let vidsink = gstreamer::ElementFactory::make("autovideosink", None).ok_or(MissingElement("autovideosink"))?;
+                vidsink.set_property("sync", &false)?;
+                let audsink = gstreamer::ElementFactory::make("autoaudiosink", None).ok_or(MissingElement("autoaudiosink"))?;
+                vidsink.set_property("sync", &false)?;
+                pipeline.add_many(&[&vidsink, &audsink]);
+
+                (vidsink, audsink)
+            }
         };
 
-        Ok(sink)
+        Ok(FrameSink {
+            pipeline: pipeline,
+            sink_type: sink_type,
+            video_sink: vid,
+            audio_sink: aud
+        })
+    }
+
+    pub fn new_mp4(uri: &str) -> Result<FrameSink, Error> {
+        Self::new(SinkType::file_mp4(uri.to_string()))
     }
 
     fn add_video_sink(&mut self, format: &VideoFormat) -> Result<gstreamer_app::AppSrc, Error> {
         let src = gstreamer::ElementFactory::make("appsrc", None).ok_or(MissingElement("appsrc"))?;
-        src.set_property("block", &true)?;
-        let videoconvert =
-            gstreamer::ElementFactory::make("videoconvert", None).ok_or(MissingElement("videoconvert"))?;
-        let vp9enc = gstreamer::ElementFactory::make("x264enc", None).ok_or(MissingElement("vp9enc"))?;
-        vp9enc.set_property("bitrate", &5000u32)?;
-        // vp9enc.set_property("threads", &4)?;
-        // vp9enc.set_property("target-bitrate", &2_000_000)?;
-        let queue = gstreamer::ElementFactory::make("queue", None).ok_or(MissingElement("queue"))?;
 
+        // let info = gstreamer_audio::AudioInfo::new(gstreamer_audio::AUDIO_FORMAT_i32, format.width as u32, format.height as u32)
+        //     .fps(format.frame_rate_gst_fraction)
+        //     .build()
+        //     .expect("Failed to create video info");
+
+        let queue = gstreamer::ElementFactory::make("queue", None).ok_or(MissingElement("queue"))?;
+        let videoconvert = gstreamer::ElementFactory::make("videoconvert", None).ok_or(MissingElement("videoconvert"))?;
         let appsrc = src.clone()
             .dynamic_cast::<gstreamer_app::AppSrc>()
             .expect("Source element is expected to be an appsrc!");
-
+        
         let mut caps = FrameSource::raw_video_caps();
         {
             let mut_structure = caps.get_mut().unwrap().get_mut_structure(0).unwrap();
@@ -208,45 +234,57 @@ impl FrameSink {
             mut_structure.set_value("width", format.width.to_send_value());
             mut_structure.set_value("height", format.height.to_send_value());
         }
-
         appsrc.set_caps(&caps);
         appsrc.set_property_format(gstreamer::Format::Time);
         appsrc.set_max_bytes(1024*1024);
         appsrc.set_property_block(true);
 
-        self.pipeline.add_many(&[&src, &queue, &videoconvert, &vp9enc])?;
-        // self.pipeline.add_many(&[&src])?;
-        src.link(&videoconvert)?;
+        self.pipeline.add_many(&[&src, &queue, &videoconvert])?;
 
-        let convert_i420_caps = gstreamer::Caps::new_simple(
-            "video/x-raw", 
-            &[
-                ("format", &"I420")
-            ]
-        );
+        src.link(&queue)?;
+        queue.link(&videoconvert)?;
 
-        videoconvert.link_filtered(&vp9enc, Some(&convert_i420_caps))?;
-        vp9enc.link(&queue)?;
-        queue.link_pads("src", &self.sink, "video_0")?;
+        match &self.sink_type {
+            &SinkType::file_mp4(_) => {
+                let x264enc = gstreamer::ElementFactory::make("x264enc", None).ok_or(MissingElement("x264enc"))?;
+                x264enc.set_property("bitrate", &5000u32)?;
+
+                self.pipeline.add_many(&[&x264enc])?;
+
+                let convert_i420_caps = gstreamer::Caps::new_simple(
+                    "video/x-raw", 
+                    &[
+                        ("format", &"I420")
+                    ]
+                );
+
+                videoconvert.link_filtered(&x264enc, Some(&convert_i420_caps))?;
+
+                x264enc.link_pads("src", &self.video_sink, "video_0")?;
+            },
+            &SinkType::playback => {
+                videoconvert.link(&self.video_sink)?;
+            }
+        };
 
         Ok(appsrc)
     }
     
     pub fn add_audio_sink(&mut self, audio_format: &AudioFormat) -> Result<gstreamer_app::AppSrc, Error> {
         let src = gstreamer::ElementFactory::make("appsrc", None).ok_or(MissingElement("appsrc"))?;
-        let audioconvert = gstreamer::ElementFactory::make("audioconvert", None).ok_or(MissingElement("audioconvert"))?;
-        let vorbisenc = gstreamer::ElementFactory::make("faac", None).ok_or(MissingElement("vorbisenc"))?;
-        vorbisenc.set_property("bitrate", &256_000i32)?;
-        let queue = gstreamer::ElementFactory::make("queue", None).ok_or(MissingElement("queue"))?;
-
-        let appsrc = src.clone()
-            .dynamic_cast::<gstreamer_app::AppSrc>()
-            .expect("Source element is expected to be an appsrc!");
 
         // let info = gstreamer_audio::AudioInfo::new(gstreamer_audio::AUDIO_FORMAT_i32, format.width as u32, format.height as u32)
         //     .fps(format.frame_rate_gst_fraction)
         //     .build()
         //     .expect("Failed to create video info");
+
+        let queue = gstreamer::ElementFactory::make("queue", None).ok_or(MissingElement("queue"))?;
+        let audioconvert = gstreamer::ElementFactory::make("audioconvert", None).ok_or(MissingElement("audioconvert"))?;
+        self.pipeline.add_many(&[&src, &queue, &audioconvert])?;
+        
+        let appsrc = src.clone()
+            .dynamic_cast::<gstreamer_app::AppSrc>()
+            .expect("Source element is expected to be an appsrc!");
 
         let mut caps = FrameSource::raw_audio_caps();
         {
@@ -259,12 +297,22 @@ impl FrameSink {
         appsrc.set_max_bytes(1024*1024);
         appsrc.set_property_block(true);
 
-        // self.pipeline.add_many(&[&src, &audioconvert])?;
-        self.pipeline.add_many(&[&src, &audioconvert, &vorbisenc, &queue])?;
-        src.link(&audioconvert)?;
-        audioconvert.link(&vorbisenc)?;
-        vorbisenc.link(&queue)?;
-        queue.link_pads("src", &self.sink, "audio_0")?;
+        src.link(&queue)?;
+        queue.link(&audioconvert)?;
+
+        match &self.sink_type {
+            &SinkType::file_mp4(_) => {
+                let faac = gstreamer::ElementFactory::make("faac", None).ok_or(MissingElement("vorbisenc"))?;
+                faac.set_property("bitrate", &256_000i32)?;
+
+                self.pipeline.add_many(&[&faac])?;
+                audioconvert.link(&faac)?;
+                faac.link_pads("src", &self.audio_sink, "audio_0")?;
+            },
+            &SinkType::playback => {
+                audioconvert.link(&self.audio_sink)?;
+            }
+        };
 
         Ok(appsrc)
     }

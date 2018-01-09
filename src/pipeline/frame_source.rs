@@ -69,7 +69,7 @@ impl FrameSource {
         )
     }
 
-    pub fn new(uri: &str, to_uri: &str) -> Result<(FrameSource,Receiver<Arc<Mutex<AudioBuffer>>>,Receiver<Arc<Mutex<VideoBuffer>>>), Error> {
+    pub fn new(uri: &str) -> Result<(FrameSource,Receiver<Arc<Mutex<AudioBuffer>>>,Receiver<Arc<Mutex<VideoBuffer>>>), Error> {
         let pipeline = gstreamer::Pipeline::new("recode-input");
 
         let src = gstreamer::ElementFactory::make("filesrc", None).ok_or(MissingElement("filesrc"))?;
@@ -170,7 +170,7 @@ impl FrameSource {
                         // height: height
                     };
 
-                    println!("Captured video buffer at time {:?}", video_buffer.time);
+                    // println!("Captured video buffer at time {:?}", video_buffer.time);
 
                     vtx_mutex.lock().unwrap().send(Arc::new(Mutex::new(video_buffer)));
                     
@@ -241,7 +241,7 @@ impl FrameSource {
                     let format = af1.lock().unwrap().clone();
                     let buffer = AudioBuffer::new(vec, format, buffer.get_pts(), buffer.get_duration());
 
-                    println!("Captured audio buffer at time {:?}", buffer.time);
+                    // println!("Captured audio buffer at time {:?}", buffer.time);
 
                     atx_mutex.lock().unwrap().send(Arc::new(Mutex::new(buffer)));
                     
