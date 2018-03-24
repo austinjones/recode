@@ -7,6 +7,7 @@ pub struct VideoFormat {
     pub frame_time: f64,
     pub width: i32,
     pub height: i32,
+    pub pixel_count: i32,
     pub frame_size: usize,
     pub frame_duration: f64
 }
@@ -19,6 +20,7 @@ impl VideoFormat {
             frame_time: 0f64,
             width: 0,
             height: 0,
+            pixel_count: 0,
             frame_size: 0,
             frame_duration: 0f64
         }
@@ -33,8 +35,13 @@ impl VideoFormat {
             frame_time: 1f64 / rate,
             width: width, 
             height: height,
+            pixel_count: width * height,
             frame_size: (4i32 * width * height) as usize,
             frame_duration: 1f64 / rate
         }
+    }
+
+    pub fn frames_in(&self, time: f64) -> usize {
+        (time * (self.frame_rate as f64)).ceil() as usize
     }
 }

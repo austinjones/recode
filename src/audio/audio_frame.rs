@@ -1,13 +1,13 @@
 use audio::audio_format::*;
 
 pub struct AudioFrame<'a> {
-    pub data: &'a mut [i32],
+    pub data: &'a [i16],
     pub format: &'a AudioFormat,
     pub time: f64
 }
 
 impl<'a> AudioFrame<'a> {
-    pub fn new(data: &'a mut [i32], format: &'a AudioFormat, time: f64) -> AudioFrame<'a> {
+    pub fn new(data: &'a [i16], format: &'a AudioFormat, time: f64) -> AudioFrame<'a> {
         AudioFrame {data: data, format:format, time: time}
     }
 

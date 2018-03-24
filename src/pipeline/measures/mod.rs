@@ -23,15 +23,15 @@ pub struct NormalizedAudioEdgeMeasure {
     edge_window: MeanWindowMeasure,
     edge_avg: MeanWindowMeasure,
     ratio: LogRatioMeasure,
-    decay: ExpDecayMeasure,
+    // decay: ExpDecayMeasure,
     sigmoid: SigmoidMeasure,
     time: f64
 }
 
 impl NormalizedAudioEdgeMeasure {
     pub fn new(af: &AudioFormat) -> NormalizedAudioEdgeMeasure {
-        let edge_frames = af.frames_in(0.022f64);
-        let avg_frames = af.frames_in(0.45f64);
+        let edge_frames = af.frames_in(0.4f64);
+        let avg_frames = af.frames_in(1f64);
         let buf_len = ::std::cmp::max(edge_frames, avg_frames);
         let vec = vec!(0f64; buf_len);
 
@@ -40,7 +40,7 @@ impl NormalizedAudioEdgeMeasure {
             edge_window: MeanWindowMeasure::new(edge_frames, 0f64),
             edge_avg: MeanWindowMeasure::new(avg_frames, 0f64),
             ratio: LogRatioMeasure::new(),
-            decay: ExpDecayMeasure::new(0.04f64, 0.16f64),
+            // decay: ExpDecayMeasure::new(0.04f64, 0.16f64),
             sigmoid: SigmoidMeasure::new(SigmoidRange::NegOneToOne),
             time: 0f64
         }
@@ -58,9 +58,9 @@ impl Measure<(), f64> for NormalizedAudioEdgeMeasure {
         let avg = self.edge_avg.value(&self.buf);
         let ratio = self.ratio.value((edge, avg));
 
-        self.decay.update((ratio, self.time));
-        let decayed = self.decay.value();
-        self.sigmoid.value(decayed)
+        // self.decay.update((ratio, self.time));
+        // let decayed = self.decay.value();
+        self.sigmoid.value(ratio)
     }
 }
 
@@ -74,7 +74,7 @@ pub struct NormalizedAudioVolumeMeasure {
 
 impl NormalizedAudioVolumeMeasure {
     pub fn new(af: &AudioFormat) -> NormalizedAudioVolumeMeasure {
-        let edge_frames = 512;
+        let edge_frames = af.frames_in(0.6f64);
         let vec = vec!(0f64; edge_frames);
 
         NormalizedAudioVolumeMeasure {
@@ -104,6 +104,7 @@ impl Measure<(), f64> for NormalizedAudioVolumeMeasure {
 
 pub struct FFTMeasure {
     buf: QueueBuf<f64>,
+    smoothed_result: Vec<f64>,
     window: Vec<f64>,
     fft_size: usize,
     buckets: usize,
@@ -117,6 +118,7 @@ impl FFTMeasure {
         FFTMeasure {
             buf: QueueBuf::new(vec!(0f64; fft_size)),
             window: hanning_iter(fft_size).collect(),
+            smoothed_result: Vec::new(),
             fft_size: fft_size,
             buckets: buckets,
             bin_size_hz: (af.rate as f64) / (fft_size as f64 / 2f64)
@@ -143,12 +145,12 @@ impl<'a, 'b> StatefulMeasure<&'a AudioFrame<'b>, Vec<f64>> for FFTMeasure {
 
         // minimum human hearing is 20hz.  any lower frequencies aren't useful for visualization
         // cut them off.
-        let min_bin = (20f64 / self.bin_size_hz).ceil() as usize;
         // fft output has a complex symmetry.  real squares are symmetric
         // last useful bin is fft_size / 2 - 1, but rust ranges have exclusive high endpoint
         // we want to constrain the range though, because higher sample frequencies increase bin sizes.
         // if we get 128khz audio, we don't want the output to change.
-        let max_bin_from_hz = (8000f64 / self.bin_size_hz).ceil() as usize;
+        let min_bin = (20f64 / self.bin_size_hz).ceil() as usize;
+        let max_bin_from_hz = (3000f64 / self.bin_size_hz).ceil() as usize;
         let max_bin = ::std::cmp::min(self.fft_size/2, max_bin_from_hz);
         let output: Vec<f64> = output[min_bin..max_bin].into_iter()
             .map(|e| e.norm_sqr().sqrt()).collect();
@@ -162,19 +164,37 @@ impl<'a, 'b> StatefulMeasure<&'a AudioFrame<'b>, Vec<f64>> for FFTMeasure {
         let output: Vec<f64> = output.into_iter()
             .map(|e| scale * e).collect();
 
-        println!("A: {}, B:{}", output.len(), self.buckets);
-        let output: Vec<f64> = output.chunks(output.len() / self.buckets)
+        // this is bad.  we lose some frames due tothe window function
+        // but it was quick.
+        // eventually I need to write a window function that preserves edges,
+        // and link it to a guassian window smoothing function.
+        // TODO; calculat from hz
+        let output: Vec<f64> = output.windows(2)
             .map(|e| ::stats::mean(e.iter().map(|e| *e)))
             .collect();
 
+        // println!("A: {}, B:{}", output.len(), self.buckets);
+        // let output: Vec<f64> = output.chunks(output.len() / self.buckets)
+        //     .map(|e| ::stats::mean(e.iter().map(|e| *e)))
+        //     .collect();
+
         let output: Vec<f64> = output.iter()
-            .map(|e| SigmoidMeasure::sigmoid(2f64*e.ln()))
+            .map(|e| SigmoidMeasure::sigmoid(4f64*e.ln()))
             .collect();
+
+        // ugly.  extend the vec so the zip will have an element to modify
+        while self.smoothed_result.len() < output.len() {
+            self.smoothed_result.push(0f64);
+        }
+
+        for (smoothed, new) in self.smoothed_result.iter_mut().zip(output.iter()) {
+            *smoothed = 0.90f64 * *smoothed + 0.10f64 * *new;
+        }
         
         // println!("Before remap: {:?}", output);
 
         println!("{} FFT bins from {:.2}Hz to {:.2}Hz", output.len(), min_freq, max_freq);
-        for v in output.iter() {
+        for v in self.smoothed_result.iter() {
             let v = *v;
             if v <= 0.01f64 {
                 print!(" ");
@@ -193,7 +213,8 @@ impl<'a, 'b> StatefulMeasure<&'a AudioFrame<'b>, Vec<f64>> for FFTMeasure {
 
         println!("");
 
-        output
+        // todo: return reference so copy is not needed
+        self.smoothed_result.clone()
     }
 }
 

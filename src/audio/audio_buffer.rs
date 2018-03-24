@@ -1,5 +1,5 @@
 
-use byteorder::{ReadBytesExt, WriteBytesExt, BigEndian, LittleEndian};
+use byteorder::{ByteOrder, ReadBytesExt, WriteBytesExt, BigEndian, LittleEndian};
 use gstreamer;
 use gstreamer_app;
 
@@ -9,28 +9,26 @@ use audio::audio_frame::*;
 pub struct AudioBuffer {
     pos: usize,
     frames: usize,
-    buffer: Vec<i32>,
+    buffer: gstreamer::Buffer,
+    samples: Vec<i16>,
     pub format: AudioFormat,
-    pub time: f64,
-    clock_time: gstreamer::ClockTime,
-    duration: gstreamer::ClockTime
+    pub time: f64
 }
 
 impl AudioBuffer {
-    pub fn new(buffer: Vec<i32>, format: AudioFormat, clock_time: gstreamer::ClockTime, duration: gstreamer::ClockTime) -> AudioBuffer {
+    pub fn new(buffer: gstreamer::Buffer, samples: Vec<i16>, format: AudioFormat) -> AudioBuffer {
         AudioBuffer {
+            time: buffer.get_pts().nanoseconds().unwrap_or(0u64) as f64 / 1_000_000_000f64,
             pos: 0,
-            frames: buffer.len() / format.frame_size,
+            frames: samples.len() / format.frame_size,
             buffer: buffer, 
-            format: format,
-            time: clock_time.nanoseconds().unwrap_or(0u64) as f64 / 1_000_000_000f64,
-            clock_time: clock_time,
-            duration: duration
+            samples: samples,
+            format: format
         }
     }
 
     pub fn num_frames(&self, format: &AudioFormat) -> usize {
-        self.buffer.len() / (format.channels as usize)
+        self.samples.len() / (format.channels as usize)
     }
 
     // pub fn iter<'a>(&'a self) -> Chunks<'a, i32> {
@@ -43,21 +41,35 @@ impl AudioBuffer {
 
     pub fn into_appsrc<'a>(self, appsrc: &'a mut gstreamer_app::AppSrc) {
         // println!("Writing audio buffer with time {:?} / duration {:?}", self.clock_time, self.duration);
-        let i32_size = ::std::mem::size_of::<i32>();
-        let mut buffer = gstreamer::Buffer::with_size(self.buffer.len() * i32_size).unwrap();
-        {
+        // let i32_size = ::std::mem::size_of::<i32>();
+        // let buf_size = self.buffer.len() * i32_size;
+        // println!("Assuming output size: {}", buf_size);
+        // let mut buffer = gstreamer::Buffer::with_size(buf_size).unwrap();
 
-            let buffer_ref = buffer.get_mut().unwrap();           
-            buffer_ref.set_pts(self.clock_time);
-            buffer_ref.set_duration(self.duration);
-            let mut buffer_writable = buffer_ref.map_writable().unwrap();
-            let mut slice = buffer_writable.as_mut_slice();
-            for int in self.buffer {
-                slice.write_i32::<LittleEndian>(int);
-            }
-        }
+        // // for f in self.buffer.chunks(2) {
+        // //     println!("LEFT: {:?}", f[0]);
+        // // }
+
+        // // for f in self.buffer.chunks(2) {
+        // //     println!("RIGHT: {:?}", f[1]);
+        // // }
+
+        // {
+        //     let buffer_ref = buffer.get_mut().unwrap();           
+        //     buffer_ref.set_pts(self.pts); 
+        //     buffer_ref.set_dts(self.dts);
+        //     buffer_ref.set_duration(self.duration);
+        //     buffer_ref.set_offset(self.offset);
+        //     let mut buffer_writable = buffer_ref.map_writable().unwrap();
+        //     let mut slice = buffer_writable.as_mut_slice();
+        //     LittleEndian::write_i32_into(self.buffer.as_slice(), slice);
+        //     // for f in slice.chunks(i32_size) {
+        //     //     println!("Output byte: {:?}", f);
+        //     // }
+        // }
         // println!("Pushing audio buffer into appsink");
-        if appsrc.push_buffer(buffer) != gstreamer::FlowReturn::Ok {
+        println!("OUT {}", self.buffer.get_pts());
+        if appsrc.push_buffer(self.buffer) != gstreamer::FlowReturn::Ok {
             println!("Error writing Audio Buffer")
         }
     }
@@ -69,7 +81,7 @@ pub struct AudioBufferIter {
     window: usize
 }
 
-impl AudioBufferIter {
+impl<'i> AudioBufferIter {
     pub fn new(buf: AudioBuffer) -> AudioBufferIter {
         AudioBufferIter {
             window: buf.format.frame_size,
@@ -83,17 +95,17 @@ impl AudioBufferIter {
     }
 
     pub fn has_next(&self) -> bool {
-        self.pos + self.window <= self.buffer.buffer.len()
+        self.pos + self.window <= self.buffer.samples.len()
     }
 
     pub fn next<'b>(&'b mut self) -> Option<AudioFrame<'b>> {
-        if self.pos + self.window <= self.buffer.buffer.len() {
+        if self.pos + self.window <= self.buffer.samples.len() {
             let time = self.buffer.time + self.pos as f64 * self.buffer.format.frame_duration;
 
             let start = self.pos;
             let end = self.pos+self.window;
 
-            let slice = &mut self.buffer.buffer.as_mut_slice()[start..end];
+            let slice = &self.buffer.samples[start..end];
             let frame = AudioFrame::new(slice, &self.buffer.format, time);
 
             self.pos += 1;

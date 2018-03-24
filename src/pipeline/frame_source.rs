@@ -48,13 +48,26 @@ impl FrameSource {
         gstreamer::Caps::new_simple(
             "audio/x-raw",
             &[
-                ("format", &gstreamer_audio::AUDIO_FORMAT_S32.to_string()),
+                ("format", &gstreamer_audio::AUDIO_FORMAT_S16.to_string()),
                 ("layout", &"interleaved"),
                 ("channels", &gstreamer::IntRange::<i32>::new(1, i32::MAX)),
-                ("rate", &gstreamer::IntRange::<i32>::new(1, i32::MAX)),
+                ("rate", &48000),
+                ("channel-mask", &gstreamer::Bitmask::new(0x0000000000000003))
             ],
         )
     }
+
+    // pub fn raw_audio_caps_output() -> gstreamer::Caps {
+    //     gstreamer::Caps::new_simple(
+    //         "audio/x-unaligned-raw",
+    //         &[
+    //             ("format", &gstreamer_audio::AUDIO_FORMAT_S32.to_string()),
+    //             ("layout", &"interleaved"),
+    //             ("channels", &gstreamer::IntRange::<i32>::new(1, i32::MAX)),
+    //             ("rate", &gstreamer::IntRange::<i32>::new(1, i32::MAX))
+    //         ],
+    //     )
+    // }
 
     pub fn raw_video_caps() -> gstreamer::Caps {
         gstreamer::Caps::new_simple(
@@ -94,6 +107,7 @@ impl FrameSource {
 
         let videoconvert = gstreamer::ElementFactory::make("videoconvert", None).unwrap();
         let audioconvert = gstreamer::ElementFactory::make("audioconvert", None).unwrap();
+        let audioresample = gstreamer::ElementFactory::make("audioresample", None).unwrap();
 
         let audiosink_appsink = 
             audiosink
@@ -200,31 +214,39 @@ impl FrameSource {
 
                         return gstreamer::FlowReturn::Error;
                     };
+                    println!("IN  {}", buffer.get_pts());
 
-                    let map = if let Some(map) = buffer.map_readable() {
-                        map
-                    } else {
-                        gst_element_error!(
-                            appsink,
-                            gstreamer::ResourceError::Failed,
-                            ("Failed to map buffer readable")
-                        );
+                    let vec;
+                    {
+                        let map = if let Some(map) = buffer.map_readable() {
+                            map
+                        } else {
+                            gst_element_error!(
+                                appsink,
+                                gstreamer::ResourceError::Failed,
+                                ("Failed to map buffer readable")
+                            );
 
-                        return gstreamer::FlowReturn::Error;
-                    };
+                            return gstreamer::FlowReturn::Error;
+                        };
 
-                    let samples = if let Ok(samples) = map.as_slice().as_slice_of::<i32>() {
-                        samples
-                    } else {
-                        gst_element_error!(
-                            appsink,
-                            gstreamer::ResourceError::Failed,
-                            ("Failed to interprete buffer as i32 PCM")
-                        );
-                
-                        return gstreamer
-                        ::FlowReturn::Error;
-                    };
+                        // println!("Buffer length: {}", map.len());
+                        let samples = if let Ok(samples) = map.as_slice().as_slice_of::<i16>() {
+                            samples
+                        } else {
+                            gst_element_error!(
+                                appsink,
+                                gstreamer::ResourceError::Failed,
+                                ("Failed to interprete buffer as i32 PCM")
+                            );
+                    
+                            return gstreamer
+                            ::FlowReturn::Error;
+                        };
+
+                        vec = samples.to_vec().clone();
+                    }
+                    
 
                     // let caps = sample.get_caps().unwrap();
                     // let caps_structure = caps.get_structure(0).unwrap();
@@ -236,10 +258,8 @@ impl FrameSource {
                     
                     // println!("Got audio sample with rate {:?}, channels {:?}", rate, channels);
                     
-                    
-                    let vec = samples.to_vec().clone();
                     let format = af1.lock().unwrap().clone();
-                    let buffer = AudioBuffer::new(vec, format, buffer.get_pts(), buffer.get_duration());
+                    let buffer = AudioBuffer::new(buffer, vec, format);
 
                     // println!("Captured audio buffer at time {:?}", buffer.time);
 
@@ -251,7 +271,7 @@ impl FrameSource {
         );
 
         self.pipeline.add_many(&[src, &decodebin])?;
-        self.pipeline.add_many(&[&audioconvert, &videoconvert])?;
+        self.pipeline.add_many(&[&audioconvert, &audioresample, &videoconvert])?;
         self.pipeline.add_many(&[&audiosink_appsink, &videosink_appsink])?;
         gstreamer::Element::link_many(&[src, &decodebin])?;
         
@@ -270,6 +290,7 @@ impl FrameSource {
                 let name = structure.get_name();
                 println!("{:?}", structure);
                 if name.starts_with("audio/") {
+                    println!("Audio structure: {:?}", structure);
                     let rate = structure.get::<i32>("rate").unwrap();
                     let channels = structure.get::<i32>("channels").unwrap();
 
@@ -281,13 +302,18 @@ impl FrameSource {
                         Err(e) => println!("Error connecting audio pad: {}", e)
                     }
 
-                    match audioconvert.link(&audiosink_appsink) {
+                    match audioconvert.link(&audioresample) {
+                        Ok(_) => println!("Connected audio pad: {}", name),
+                        Err(e) => println!("Error connecting audio pad: {}", e)
+                    }
+
+                    match audioresample.link(&audiosink_appsink) {
                         Ok(_) => println!("Connected audio conversion to audio sink"),
                         Err(e) => println!("Error connecting audio conversion: {}", e)
                     }
 
                     audioconvert.sync_state_with_parent();
-
+                    audioresample.sync_state_with_parent();
                 }
                 
                 if name.starts_with("video/") {
