@@ -11,6 +11,10 @@ use stats::OnlineStats;
 use pipeline::queue_buf::*;
 use std::sync::Arc;
 
+use rayon::prelude::*;
+use rayon::*;
+use rayon;
+
 mod tests {
     use FrameTransformImpl;
 
@@ -66,7 +70,64 @@ pub struct FrameTransformImpl {
     r_buf: Option<QueueBuf<f64>>,
     fft: Option<FFTMeasure>,
     fft_map_cache: Option<Vec<Option<PixelMap>>>,
-    angle: f64
+    angle: f64,
+    premap: Premap
+}
+
+struct Premap {
+    theta: Vec<f64>,
+    magnitude: Vec<f64>,
+    grayscale: Vec<f64>,
+    y: Vec<f64>
+}
+
+impl Premap {
+
+    pub fn new() -> Premap {
+        let magnitude = Self::calculate_magnitudes();
+        Premap {
+            theta: Self::calculate_theta(),
+            grayscale: Self::calculate_grayscale(&magnitude),
+            magnitude: magnitude,
+            y: Self::calculate_y()
+        }
+    }
+
+    fn calculate_theta() -> Vec<f64> {
+        (0..65536).map(|e| {
+            let u = FrameTransformImpl::usize_to_f64(e / 256);
+            let v = FrameTransformImpl::usize_to_f64(e % 256);
+
+            (v).atan2(u)
+        }).collect()
+    }
+
+    fn calculate_magnitudes() -> Vec<f64> {
+        (0..65536).map(|e| {
+            let u = FrameTransformImpl::usize_to_f64(e / 256);
+            let v = FrameTransformImpl::usize_to_f64(e % 256);
+
+            (u*u+v*v).sqrt()
+        }).collect()
+    }
+
+    fn calculate_grayscale(magnitude_premap: &Vec<f64>) -> Vec<f64> {
+        (0..65536).map(|e| {
+            let zero_point = 100.0;
+            let grayval = (128.0 - zero_point - magnitude_premap[e]).max(0.0) / (128.0 - zero_point);
+            grayval.powf(0.35)
+        }).collect()
+    }
+    
+    fn calculate_y() -> Vec<f64> {
+        (0..256).map(|y: usize| {
+            // we remap the luminosity to increase the overall lightness of the image
+            // this should be user input, not hardcoded
+            // need to look into how video editors handle color maps...
+            let y = FrameTransformImpl::sigmoid_remap(y as u8, 72f64);
+            FrameTransformImpl::to_uf64(y)
+        }).collect()
+    }
 }
 
 impl FrameTransformImpl {
@@ -79,7 +140,8 @@ impl FrameTransformImpl {
             fft_map_cache: None,
             theta_r_buf: None,
             r_buf: None,
-            angle: 0f64
+            angle: 0f64,
+            premap: Premap::new()
         }
     }
 
@@ -171,6 +233,7 @@ impl FrameTransformImpl {
 
     pub fn box_filter<F>(vec: &mut Vec<f64>, box_radius: usize, width: usize, function: F) where F: Fn(f64, f64) -> f64 {
         let height = vec.len()/width;
+
         for vcell in 0..height {
             let vpos = vcell * width;
 
@@ -188,14 +251,15 @@ impl FrameTransformImpl {
                 let kernel_val = kernel / kernel_len as f64;
                 output[hcell] = function(cell_val, kernel_val);
                 // println!("H: {}x{}, vnew: {}, kernel: {}", vcell, hcell, vec[vpos+hcell], kernel);
-                let add_pos = hcell + box_radius;
+                let add_pos = hcell + box_radius + 1;
                 let remove_pos = hcell as isize - box_radius as isize;
+                // println!("hcell: {}, box_radius: {}, remove_pos: {}", hcell, box_radius, remove_pos);
                 if add_pos < width {
                     kernel += vec[vpos + add_pos];
                     kernel_len += 1;
                 }
                 if remove_pos >= 0 {
-                    kernel -= vec[vpos + remove_pos as usize];
+                    kernel -= vec[vpos + (remove_pos as usize)];
                     kernel_len -= 1;
                 }
             }
@@ -258,7 +322,6 @@ impl FrameTransformImpl {
         // but that might actually look cool.
 
         // It is also super super super fast.
-
         Self::box_filter(vec, Self::pixels_from(box_radius, width), width, |cell, kernel| {
             let diff = f64::abs(cell - kernel);
             cell + strength * diff
@@ -315,47 +378,8 @@ impl FrameTransformImpl {
             n.round() as u8
         }
     }
-}
 
-struct PixelMap {
-    idx: usize,
-    x_pos: f64,
-    y_pos: f64,
-    scale_x: f64,
-    scale_y: f64
-}
-
-impl FrameTransform for FrameTransformImpl {
-    fn process_audio_frame(&mut self, aframe: &mut AudioFrame, atime: f64) {
-        // if self.frame_counter < 50 {
-        //     self.frame_counter += 1;
-        //     return;
-        // } else {
-        //     self.frame_counter = 0;
-        // }
-        if aframe.sum() == 0f64 {
-            return;
-        }
-
-        if self.audio_edge.is_none() {
-            self.audio_edge = Some(NormalizedAudioEdgeMeasure::new(&aframe.format));
-        }
-
-        if self.audio_volume.is_none() {
-            self.audio_volume = Some(NormalizedAudioVolumeMeasure::new(&aframe.format));
-        }
-
-        if self.fft.is_none() {
-            self.fft = Some(FFTMeasure::new(&aframe.format, 256));
-        }
-
-        self.audio_edge.as_mut().unwrap().update(aframe);
-        self.audio_volume.as_mut().unwrap().update(aframe);
-        // self.fft.as_mut().unwrap().update(aframe);
-    }
-
-
-    fn process_video_frame(&mut self, vframe: &mut VideoFrame, vtime: f64) {
+    fn init(&mut self, vframe: &VideoFrame) {
         if self.theta_r_buf.is_none() {
             let buf_size = vframe.format.frames_in(10.0);
             self.theta_r_buf = Some(QueueBuf::new(vec![0f64; buf_size]));
@@ -363,162 +387,43 @@ impl FrameTransform for FrameTransformImpl {
         }
 
         // let mut fft_output = vec!(Complex64::zero(); FFT_SIZE);
+    }
+
+    fn get_abs_vol(&mut self) -> f64 {
         let mut abs_vol = self.audio_volume.as_mut().map(|e| e.value(())).unwrap_or(0f64);
         if abs_vol.is_nan() {
-            abs_vol = 0f64;
+            0f64
+        } else {
+            abs_vol
         }
+    }
 
-        // let fft: Vec<f64> = self.fft.as_mut().map(|e| e.value()).unwrap_or_else(|| vec!(0f64; 1));
-        
+    fn get_disturbance(&mut self) -> f64{
         let mut disturbance = self.audio_edge.as_mut().map(|e| e.value(())).unwrap_or(0f64);
         if disturbance.is_nan() {
-            disturbance = 0f64;
+           0f64
+        } else {
+            disturbance
         }
-        let raw_rotation = (1f64+3f64*abs_vol) * ROTATION_RATE;
+    }
 
-        println!("Raw Rotation: {:.2}, Angle: {:.2}, Time: {:.2}, Abs vol: {:.2}, audio_edge: {:.2}",raw_rotation, self.angle, vtime, abs_vol, disturbance);
-        // self.fft.process(audio_vec.as_mut_slice(), fft_output.as_mut_slice());
-        // let fft_output: Vec<f64> = fft_output[0..FFT_SIZE/2].iter().map(|e| e.norm_sqr()).collect();
-        // let center_of_mass = Self::center_of_mass(fft_output.as_slice());
-        // let avg = fft_output.iter().fold(0f64, |a,b| a+b) / (fft_output.len() as f64);
-        // let fft_output: Vec<f64> = fft_output.iter().map(|e| e / avg).collect();
-
-        // let low = fft_output[0..FFT_SIZE/4].iter().fold(0f64, |a,b| a+b) / (FFT_SIZE as f64 / 2f64);
-        // let high = fft_output[FFT_SIZE/4..FFT_SIZE/2].iter().fold(0f64, |a,b| a+b) / (FFT_SIZE as f64 / 2f64);
-        // println!("Low: {}, High: {}", low, high);
-
-        // let rotation = (vtime % 7f64) / 7f64;
-        // println!("Avg vol: {}, Max Vol: {}, vol ratio: {}, avg ratio: {}", avg_vol, self.max_vol, abs_vol, avg_abs_vol);
-        self.angle += raw_rotation * vframe.format.frame_duration;
+    fn update_angle(&mut self, rotation: f64, vframe: &VideoFrame) {
+        self.angle += rotation * vframe.format.frame_duration;
         while self.angle > 1.0 {
             self.angle -= 1.0;
         }
-        // self.disturb_buf.push(raw_disturb);
-        // println!("Vol_Decay: {}, disturb: {}", self.volratio_decay, disturbance);
-        // let disturbance = Self::avg(self.disturb_buf.extract().as_slice());
-        // let disturbance = Self::sigmoid(5f64*disturbance)-0.5f64;
-        // let disturbance = Self::sigmoid(5f64*(self.abs_vol_decay - avg_abs_vol))-0.5f64;
-        // println!("Rotation: {}, raw disturb: {}, disturbance: {}", raw_rotation, raw_disturb, disturbance);
-        // let rotation = Self::sigmoid(15f64 * (high - low))-0.5f64);
+    }
 
-        
-        // println!("Low: {}, High: {}", low, high);
-        // println!("Diff: {}, Rotation: {}", (high-low), rotation);
-
-        // if self.queue_buf.is_saturated() {
-        //     // println!("FFT input: {:?}", audio_vec);
-        //     // println!("FFT output: {:?}", fft_output);
-        // }
-
-        let avg_range = 3isize;
-        let avg_dispersion = 4isize;
-        let avg_square = ((1 + 2 * avg_range) * (1 + 2 * avg_range)) as f64;
-        let pixels = vframe.data.len() / 4usize;
-        
-        // let ys: Vec<f64> = vframe.data.chunks(4).map(|pixs| {
-        //     pixs[1] as f64
-        // }).collect();
-
-        // let ys: Vec<f64> = (0..(ys.len())).into_iter().map(|pix_idx| {
-        //     // println!("x: {}, y: {}", x_idx, y_idx);
-        //     let mut sum = 0f64;
-
-        //     for y_delta in -avg_range..avg_range {
-        //         for x_delta in -avg_range..avg_range {
-        //             let offset = (vframe.format.width as isize) * y_delta as isize + x_delta;
-        //             let idx = (pix_idx as isize + offset) as usize;
-        //             // println!("pix_idx: {}, x: {}, y: {}, x_delta: {}, y_delta: {}, offset: {}, idx: {}", pix_idx, x_idx, y_idx, x_delta, y_delta, offset, idx);
-        //             if idx > 0 && ((idx as usize) < ys.len()) {
-        //                 let y = ys[idx as usize];
-        //                 sum += y;
-        //             }
-        //         }
-        //     }
-
-        //     sum / avg_square
-        // }).collect();
-
-        // let us: Vec<f64> = vframe.data.chunks(4).map(|pixs| {
-        //     Self::to_f64(pixs[2])
-        // }).collect();
-
-        // TODO: experiment wich changing the calculation of idx here.
-        // if idx is calculated with something other than vframe.format.width as the line size
-        // some awesome interference patterns come out
-        // maybe some sort of line-based remapping could be used as a filter for effects.
-        // e.g. line width is 100 but things are mapped based on (80*y+x)
-        // let us: Vec<f64> = (0..(us.len())).into_iter().map(|pix_idx| {
-        //     // println!("x: {}, y: {}", x_idx, y_idx);
-        //     let mut sum = 0f64;
-
-        //     for y_delta in -avg_range..avg_range {
-        //         for x_delta in -avg_range..avg_range {
-        //             let offset = avg_dispersion * (vframe.format.width as isize) * y_delta as isize + avg_dispersion * x_delta;
-        //             let idx = (pix_idx as isize + offset) as usize;
-        //             // println!("pix_idx: {}, x: {}, y: {}, x_delta: {}, y_delta: {}, offset: {}, idx: {}", pix_idx, x_idx, y_idx, x_delta, y_delta, offset, idx);
-        //             if idx > 0 && ((idx as usize) < us.len()) {
-        //                 let u = us[idx as usize];
-        //                 sum += u;
-        //             }
-        //         }
-        //     }
-
-        //     sum / avg_square
-        // }).collect();
-
-        // let vs: Vec<f64> = vframe.data.chunks(4).map(|pixs| {
-        //     Self::to_f64(pixs[3])
-        // }).collect();
-
-        // let vs: Vec<f64> = (0..(vs.len())).into_iter().map(|pix_idx| {
-        //     let mut sum = 0f64;
-
-        //     for y_delta in -avg_range..avg_range {
-        //         for x_delta in -avg_range..avg_range {
-        //             let offset = avg_dispersion * (vframe.format.width as isize) * y_delta as isize + avg_dispersion * x_delta;
-        //             let idx = (pix_idx as isize + offset) as usize;
-        //             if idx > 0 && ((idx as usize) < us.len()) {
-        //                 let v = vs[idx];
-        //                 sum += v;
-        //             }
-        //         }
-        //     }
-
-        //     sum / avg_square
-        // }).collect();
-
-        // let thetas: Vec<f64> = us.iter().zip(vs.iter()).map(|(u,v)| {
-        //     (v).atan2(*u)
-        // }).collect();
-
-        // let magnitudes: Vec<f64> = us.iter().zip(vs.iter()).map(|(u,v)| {
-        //     (u*u+v*v).sqrt()
-        // }).collect();
-
-        let thetas: Vec<f64> = (0..65536).map(|e| {
-            let u = Self::usize_to_f64(e / 256);
-            let v = Self::usize_to_f64(e % 256);
-
-            (v).atan2(u)
-        }).collect();
-
-        let magnitudes: Vec<f64> = (0..65536).map(|e| {
-            let u = Self::usize_to_f64(e / 256);
-            let v = Self::usize_to_f64(e % 256);
-
-            (u*u+v*v).sqrt()
-        }).collect();
-
-        // let mut colorstats = OnlineStats::new();
+    fn calculate_theta_r(&mut self, vframe: &VideoFrame) -> (f64, f64) {
         let mut u_sum = 0f64;
         let mut v_sum = 0f64;
         let mut n_sum = 0usize;
         let scan_pixels = 257;
-        for pixel in vframe.data.chunks_mut(4 * scan_pixels) {
+        for pixel in vframe.data.chunks(4 * scan_pixels) {
             let u = pixel[2];
             let v = pixel[3];
             let uv_idx = u as usize * 256 + v as usize;
-            let theta = thetas[uv_idx];
+            let theta = self.premap.theta[uv_idx];
 
             u_sum += theta.cos();
             v_sum += theta.sin();
@@ -542,18 +447,17 @@ impl FrameTransform for FrameTransformImpl {
         let theta_r = mean(self.theta_r_buf.as_ref().unwrap().extract().iter().map(|e| *e));
         let r = mean(self.r_buf.as_ref().unwrap().extract().iter().map(|e| *e));
         println!("Avg theta-r: {:.2}, avg r: {:.2}", theta_r, r);
+        (theta_r, r)
+    }
 
-        let gray_mags: Vec<f64> = (0..65536).map(|e| {
-            let zero_point = 100.0;
-            let grayval = (128.0 - zero_point - magnitudes[e]).max(0.0) / (128.0 - zero_point);
-            grayval.powf(0.35)
-        }).collect();
 
-        let final_thetas: Vec<f64> = (0..65536).map(|e| {
+
+    fn calculate_theta_framemap(&self, disturbance: f64, theta_r: f64, r: f64, abs_vol: f64) -> Vec<f64> {
+            (0..65536).map(|e| {
             let u = Self::usize_to_f64(e / 256);
             let v = Self::usize_to_f64(e % 256);
 
-            let pretheta = thetas[e]; // + 2f64 * ::std::f64::consts::PI * (self.angle + 0.05f64 * disturbance);
+            let pretheta = self.premap.theta[e]; // + 2f64 * ::std::f64::consts::PI * (self.angle + 0.05f64 * disturbance);
             
             let diff = pretheta - theta_r;
 
@@ -569,6 +473,9 @@ impl FrameTransform for FrameTransformImpl {
             // TODO: create crate for polar coordinates, or use an open source crate
             let theta_premap = self.angle + theta_sig + 0.05f64 * disturbance;
             // let theta_premap = disturbance;
+
+            // oh my god the horror
+            // I need to write a modular arethmitic type
             let mut theta_premap = 2f64 * ::std::f64::consts::PI * theta_premap;
             while theta_premap >= 2.0 * ::std::f64::consts::PI {
                 theta_premap -= 2.0 * ::std::f64::consts::PI;
@@ -577,7 +484,7 @@ impl FrameTransform for FrameTransformImpl {
                 theta_premap += 2.0 * ::std::f64::consts::PI;
             }
 
-            let gray = gray_mags[e];
+            let gray = self.premap.grayscale[e];
             let mut theta_premap = theta_premap + (theta_premap * 4.0).sin() / 4.0 + 3.0 * ::std::f64::consts::E.powf(-8.0 * (theta_premap - 0.8 * ::std::f64::consts::PI).powf(2.0));
             while theta_premap >= 2.0 * ::std::f64::consts::PI {
                 theta_premap -= 2.0 * ::std::f64::consts::PI;
@@ -595,10 +502,12 @@ impl FrameTransform for FrameTransformImpl {
                 theta_premap += 2.0 * ::std::f64::consts::PI;
             }
             theta_premap
-        }).collect();
+        }).collect()
+    }
 
-        let final_mags: Vec<f64> = (0..65536).map(|e| {
-            let mut theta = final_thetas[e];
+    fn calculate_saturation_framemap(&self, theta_framemap: &Vec<f64>, disturbance: f64, abs_vol: f64) -> Vec<f64> {
+        (0..65536).map(|e| {
+            let mut theta = theta_framemap[e];
             while theta > ::std::f64::consts::PI {
                 theta -= 2f64 * ::std::f64::consts::PI;
             }
@@ -609,15 +518,17 @@ impl FrameTransform for FrameTransformImpl {
             // let ceil_amount = fft_index - fft_index.floor();
             // let fft_val = ceil_amount * fft_ceil + (1f64 - ceil_amount) * fft_floor;
             // println!("Disturbance: {:.2}", disturbance);
-            let gray_val = gray_mags[e];
+            let gray_val = self.premap.grayscale[e];
             let base_saturation = 64.0 * (1.0 + abs_vol * 0.3);
             let gray_saturation = 90.0 * (1.0 + abs_vol * 0.3);
-            gray_val * gray_saturation + (1.0-gray_val) * (base_saturation + 2f64 * magnitudes[e] + 16f64 * disturbance)
-        }).collect();
+            gray_val * gray_saturation + (1.0-gray_val) * (base_saturation + 2f64 * self.premap.magnitude[e] + 16f64 * disturbance)
+        }).collect()
+    }
 
-        let final_uv: Vec<(f64, f64)> = (0..65536).map(|e| {
-            let mag = final_mags[e]; // * (1.5f64 + 1.1f64 * disturbance);
-            let theta = final_thetas[e];
+    fn calculate_uv_framemap(&self, magnitude_framemap: &Vec<f64>, theta_framemap: &Vec<f64>) -> Vec<(f64, f64)> {
+        (0..65536).map(|e| {
+            let mag = magnitude_framemap[e]; // * (1.5f64 + 1.1f64 * disturbance);
+            let theta = theta_framemap[e];
 
             if theta.is_nan() || mag.is_nan() {
                 return (0f64, 0f64);
@@ -657,239 +568,125 @@ impl FrameTransform for FrameTransformImpl {
             // println!("Mag: {:.2}, Theta: {:.2}, u: {:.2}, v: {:.2}", mag, theta, u, v);
 
             (u, v)
-        }).collect();
+        }).collect()
+    }
 
-        let final_y: Vec<u8> = (0..256).map(|y: usize| {
-            // we remap the luminosity to increase the overall lightness of the image
-            // this should be user input, not hardcoded
-            // need to look into how video editors handle color maps...
-            Self::sigmoid_remap(y as u8, 72f64)
-        }).collect();
-
-        // let thetas: Vec<f64> = (0..(thetas.len())).into_iter().map(|pix_idx| {
-        //     let y_idx = pix_idx / (vframe.format.width as usize);
-        //     let x_idx = pix_idx % (vframe.format.width as usize);
-        //     let mut sin = 0f64;
-        //     let mut cos = 0f64;
-
-        //     for y_delta in -avg_range..avg_range {
-        //         for x_delta in -avg_range..avg_range {
-        //             let idx = 256isize * (y_idx as isize + y_delta) + x_idx as isize + x_delta;
-        //             if idx > 0 && ((idx as usize) < thetas.len()) {
-        //                 let t = thetas[idx as usize];
-        //                 sin += t.sin();
-        //                 cos += t.cos();
-        //             }
-        //         }
-        //     }
-
-        //     sin.atan2(cos)
-        // }).collect();
-
-        let mut us: Vec<f64> = vframe.data.chunks(4).map(|pixel| {
+    fn calculate_u_pixelmap(&self, vframe: &VideoFrame, uv_framemap: &Vec<(f64, f64)>) -> Vec<f64> {
+        vframe.data.chunks(4).map(|pixel| {
             let u = pixel[2];
             let v = pixel[3];
             let uv_idx = u as usize * 256 + v as usize;
-            let (u, _) = final_uv[uv_idx];
+            let (u, _) = uv_framemap[uv_idx];
             u
-        }).collect();
+        }).collect()
+    }
 
-        let mut vs: Vec<f64> = vframe.data.chunks(4).map(|pixel| {
-            let preu = pixel[2];
-            let prev = pixel[3];
-            let uv_idx = preu as usize * 256 + prev as usize;
-            let (_, v) = final_uv[uv_idx];
-            // println!("V: {:.2} => {:.2}", prev, v);
+
+    fn calculate_v_pixelmap(&self, vframe: &VideoFrame, uv_framemap: &Vec<(f64, f64)>) -> Vec<f64> {
+        vframe.data.chunks(4).map(|pixel| {
+            let u = pixel[2];
+            let v = pixel[3];
+            let uv_idx = u as usize * 256 + v as usize;
+            let (_, v) = uv_framemap[uv_idx];
             v
-        }).collect();
+        }).collect()
+    }
+
+    fn calculate_y_pixelmap(&self, vframe: &VideoFrame) -> Vec<f64> {
+        vframe.data.chunks(4).map(|pixel| {
+            self.premap.y[pixel[1] as usize]
+        }).collect()
+    }
+}
+
+struct PixelMap {
+    idx: usize,
+    x_pos: f64,
+    y_pos: f64,
+    scale_x: f64,
+    scale_y: f64
+}
+
+impl FrameTransform for FrameTransformImpl {
+    fn process_audio_frame(&mut self, aframe: &mut AudioFrame, atime: f64) {
+        // if self.frame_counter < 50 {
+        //     self.frame_counter += 1;
+        //     return;
+        // } else {
+        //     self.frame_counter = 0;
+        // }
+        if aframe.sum() == 0f64 {
+            return;
+        }
+
+        if self.audio_edge.is_none() {
+            self.audio_edge = Some(NormalizedAudioEdgeMeasure::new(&aframe.format));
+        }
+
+        if self.audio_volume.is_none() {
+            self.audio_volume = Some(NormalizedAudioVolumeMeasure::new(&aframe.format));
+        }
+
+        // if self.fft.is_none() {
+        //     self.fft = Some(FFTMeasure::new(&aframe.format, 256));
+        // }
+
+        self.audio_edge.as_mut().unwrap().update(aframe);
+        self.audio_volume.as_mut().unwrap().update(aframe);
+        // self.fft.as_mut().unwrap().update(aframe);
+    }
+
+    fn process_video_frame(&mut self, vframe: &mut VideoFrame, vtime: f64) {
+        self.init(vframe);
+        let abs_vol = self.get_abs_vol();
+        let disturbance = self.get_disturbance();
+        let raw_rotation = (1f64+3f64*abs_vol) * ROTATION_RATE;
+        self.update_angle(raw_rotation, vframe);
         
-        let mut ys: Vec<f64> = vframe.data.chunks(4).map(|pixel| {
-            Self::to_uf64(final_y[pixel[1] as usize])
-        }).collect();
+        println!("Raw Rotation: {:.2}, Angle: {:.2}, Time: {:.2}, Abs vol: {:.2}, audio_edge: {:.2}",raw_rotation, self.angle, vtime, abs_vol, disturbance);
+        
+        let (theta_r, r) = self.calculate_theta_r(vframe);
 
-        Self::box_blur(&mut us, 0.01, vframe.format.width as usize);
-        Self::box_blur(&mut vs, 0.01, vframe.format.width as usize);
-        Self::box_edgefilter(&mut ys, 0.0035, vframe.format.width as usize, 1.6);
+        let theta_framemap = self.calculate_theta_framemap(disturbance, abs_vol, theta_r, r);
+        let saturation_framemap = self.calculate_saturation_framemap(&theta_framemap, disturbance, abs_vol);
+        let uv_framemap = self.calculate_uv_framemap(&saturation_framemap, &theta_framemap);
+        
+        let mut y_pixelmap = None;
+        let mut u_pixelmap = None;
+        let mut v_pixelmap = None;
 
-        // gamma correction
-        let mut ys: Vec<f64> = ys.iter().map(|y| {
-            0.68 * y.powf(1.05)
-        }).collect();
+        // a bit of parallelism.
+        // technically the y/u/v channels don't have any data dependency,
+        // and the work done above is on small data sizes (65536 u/v colors)
+        // this is the heavy lifting, so let's parallelize it.
+        rayon::scope(|s| {
+            s.spawn(|_| {
+                let mut ys = self.calculate_y_pixelmap(vframe);
+                Self::box_edgefilter(&mut ys, 0.0055, vframe.format.width as usize, 1.6);
+                // gamma correction
+                let ys: Vec<f64> = ys.iter().map(|y| {
+                    0.68 * y.powf(1.05)
+                }).collect();
+                y_pixelmap = Some(ys);
+            });
 
-        // Self::box_edgefilter(&mut ys, 0.020, vframe.format.width as usize, 0.6);
+            s.spawn(|_| {
+                let mut us = self.calculate_u_pixelmap(vframe, &uv_framemap);
+                Self::box_blur(&mut us, 0.01, vframe.format.width as usize);
+                u_pixelmap = Some(us);
+            });
 
-        // if self.fft_map_cache.is_none() {
-        //     let vec: Vec<Option<PixelMap>> = (0..vframe.format.pixel_count).map(|vdx| {
-        //         let x = vdx % (vframe.format.width);
-        //         let y = vdx / (vframe.format.width);
+            s.spawn(|_| {
+                let mut vs = self.calculate_v_pixelmap(vframe, &uv_framemap);
+                Self::box_blur(&mut vs, 0.01, vframe.format.width as usize);
+                v_pixelmap = Some(vs);
+            });
+        });
 
-        //         let x_rel = x as f64 / vframe.format.width as f64;
-        //         let y_rel = y as f64 / vframe.format.height as f64;
-
-        //         let f_x = x_rel;
-        //         let f_y = y_rel;
-                
-        //         // x(h-l) + l
-        //         // (x + l) * (h - l) = i
-        //         // (i - l) / (h-l)
-        //         let aspect_correction = vframe.format.height as f64 / vframe.format.width as f64;
-        //         let d_x = f_x - 0.5;
-        //         let d_y = f_y - 0.5;
-        //         let d_z = 0.37;
-        //         let P = (d_x*d_x + d_y*d_y + d_z*d_z).sqrt();
-        //         let f_x = 0.5 + d_x * P.abs();
-        //         let f_y = 0.5 + d_y * P.abs();
-
-        //         let x_min = 0.185;
-        //         let x_max = 0.808;
-
-        //         let y_min = 0.190;
-        //         let y_max = 0.808;
-
-        //         let f_x = (f_x - x_min) / (x_max - x_min);
-        //         let f_y = (f_y - y_min) / (y_max - y_min);
-
-        //         if f_x < 0f64 || f_x > 1f64 || f_y < 0f64 || f_y > 1f64 {
-        //             // we want to map some pixels outside of the bounding box
-        //             // these are pixels outside of the fisheye
-        //             // for these pixels, we return None, since we don't want to map any color.
-        //             return None;
-        //         }
-
-        //         let f_x = 1.0 - (2.0 * (f_x - 0.5).abs());
-        //         let f_y = 1.0 - (2.0 * (f_y - 0.5).abs());
-        //         // println!("fft_x: {:.1}, fft_y: {:.1}", fft_x, fft_y);
-
-        //         // was -25, +13
-        //         let x_sin = (vdx % (vframe.format.width)) as f64 / vframe.format.width as f64;
-        //         let y_sin = (vdx / (vframe.format.width)) as f64 / vframe.format.height as f64;
-        //         // println!("x: {:.2},  y: {:.2}, x_sin: {:.2}, y_sin: {:.2}", x_rel, y_rel, x_sin, y_sin);
-
-        //         let sin_scale = 150.0;
-        //         let x_comp = (f_x as f64 * sin_scale).sin();
-        //         let y_comp = (f_y as f64 * sin_scale).cos();
-
-        //         let edge_fade = 0.01;
-        //         let edge_dist_x = f_x.min(1.0-f_x);
-        //         let edge_dist_y = f_y.min(1.0-f_y);
-        //         let scale = ((1.0/edge_fade) * edge_dist_x.min(edge_dist_y)).min(1.0);
-
-        //         let map = PixelMap {
-        //             idx: vdx as usize,
-        //             x_pos: f_x,
-        //             y_pos: f_y,
-        //             scale_x: scale * x_comp,
-        //             scale_y: scale * y_comp
-        //         };
-        //         Some(map)
-        //     }).filter(|e| e.is_some())
-        //       .collect();
-        //     self.fft_map_cache = Some(vec);
-        // }
-
-        // for map in self.fft_map_cache.as_ref().unwrap().iter() {
-        //     if map.is_none() {
-        //         continue;
-        //     }
-
-        //     let map = map.as_ref().unwrap();
-
-        //     let v = vs[map.idx];
-        //     let u = us[map.idx];
-
-        //     let fft_val_x = Self::get_smooth(&fft, map.x_pos);
-        //     let fft_val_y = Self::get_smooth(&fft, map.y_pos);
-
-        //     // there is a sin wave transformation hidden in scale_x and scale_y
-        //     let mutation = fft_val_x * map.scale_x + fft_val_y * map.scale_y;
-        //     vs[map.idx] = v * (1.0f64 + 0.75f64 * mutation);
-        //     us[map.idx] = u * (1.0f64 + 0.75f64 * mutation);
-        // }
-
-        // for (v, u) in vs.iter_mut().zip(us.iter_mut()) {
-        //     let x = vdx % (vframe.format.width);
-        //     let y = vdx / (vframe.format.width);
-
-        //     let x_rel = x as f64 / vframe.format.width as f64;
-        //     let y_rel = y as f64 / vframe.format.height as f64;
-
-        //     let f_x = x_rel;
-        //     let f_y = y_rel;
-            
-        //     // x(h-l) + l
-        //     // (x + l) * (h - l) = i
-        //     // (i - l) / (h-l)
-        //     let d_x = f_x - 0.5;
-        //     let d_y = f_y - 0.5;
-        //     let d_z = 0.39;
-        //     let P = (d_x*d_x + d_y*d_y + d_z*d_z).sqrt();
-        //     let f_x = 0.5 + d_x * P.abs();
-        //     let f_y = 0.5 + d_y * P.abs();
-
-        //     let x_min = 0.183;
-        //     let x_max = 0.811;
-
-        //     let y_min = 0.185;
-        //     let y_max = 0.813;
-
-        //     let f_x = (f_x - x_min) / (x_max - x_min);
-        //     let f_y = (f_y - y_min) / (y_max - y_min);
-
-        //     if f_x < 0f64 || f_x > 1f64 || f_y < 0f64 || f_y > 1f64 {
-        //         if vdx % 1000000 == 0 {
-        //              println!("x_rel: {:.2}, f_x: {:.2}, y_rel: {:.2}, f_y: {:.2}", x_rel, f_x, y_rel, f_y);
-        //         }
-        //         vdx += 1;
-        //         continue;
-        //     } else {
-                
-        //     }
-
-
-        //     let fft_scale = 1.0 / 3.0;
-        //     let sin_scale = 250.0;
-
-        //     let f_x = 1.0 - (2.0 * (f_x - 0.5).abs());
-        //     let f_y = 1.0 - (2.0 * (f_y - 0.5).abs());
-        //     // println!("fft_x: {:.1}, fft_y: {:.1}", fft_x, fft_y);
-        //     let fft_val_x = Self::get_smooth(&fft, f_x);
-        //     let fft_val_y = Self::get_smooth(&fft, f_y);
-
-        //     // was -25, +13
-        //     let x_sin = (vdx % (vframe.format.width)) as f64 / vframe.format.width as f64;
-        //     let y_sin = (vdx / (vframe.format.width)) as f64 / vframe.format.height as f64;
-        //     // println!("x: {:.2},  y: {:.2}, x_sin: {:.2}, y_sin: {:.2}", x_rel, y_rel, x_sin, y_sin);
-        //     let x_comp = (f_x as f64 * sin_scale).sin();
-        //     let y_comp = (f_y as f64 * sin_scale).cos();
-
-        //     let edge_fade = 0.01;
-        //     let edge_dist_x = f_x.min(1.0-f_x);
-        //     let edge_dist_y = f_y.min(1.0-f_y);
-        //     let scale = ((1.0/edge_fade) * edge_dist_x.min(edge_dist_y)).min(1.0);
-
-        //     let strength = scale * 0.75f64;
-        //     let mutation = fft_val_x * x_comp + fft_val_y * y_comp;
-
-        //     *v = *v * (1.0f64 + strength * mutation); // + strength * fft_val_y;
-        //     *u = *v * (1.0f64 + strength * mutation); // + strength * fft_val_y;
-        //     vdx += 1;
-        // }
-
-        // for v in vs.iter_mut() {
-        //     let x = vdx % (vframe.format.width - 25);
-        //     let y = vdx / (vframe.format.width + 13);
-        //     let x_comp = 12f64 * (x as f64 / 5f64).sin();
-        //     let y_comp = 12f64 * (y as f64 / 5f64).sin();
-        //     *v = *v + x_comp + y_comp;
-        // }
-        // for v in vs.iter_mut() {
-        //     let x = vdx % (vframe.format.width - 25);
-        //     let y = vdx / (vframe.format.width + 13);
-        //     let x_comp = 12f64 * (x as f64 / 5f64).sin();
-        //     let y_comp = 12f64 * (y as f64 / 5f64).sin();
-        //     *v = *v + x_comp + y_comp;
-        //     vdx += 1;
-        // }
+        // now collect the results and write them back into the frame
+        let ys = y_pixelmap.unwrap();
+        let us = u_pixelmap.unwrap();
+        let vs = v_pixelmap.unwrap();
 
         let mut pixel_idx = 0usize;
         for pixel in vframe.data.chunks_mut(4) {
@@ -899,42 +696,5 @@ impl FrameTransform for FrameTransformImpl {
 
             pixel_idx += 1;
         }
-        
-
-        // let x_size = vframe.format.width as usize;
-        // let y_size = vframe.format.height as usize;
-
-        // let smooth_dist = 2;
-        // let smooth_area = ((2*smooth_dist+1) * (2*smooth_dist+1)) as usize;
-        // let avg_dispersion = 4;
-        // let pixel_len = x_size * y_size;
-        // for pixel_idx in 0..pixel_len {
-        //     let pixel_y = pixel_idx / x_size;
-        //     let mut us = 0f64;
-        //     let mut vs = 0f64;
-        //     for y_delta in -smooth_dist..(smooth_dist+1) {
-        //         for x_delta in -smooth_dist..(smooth_dist+1) {
-        //             let offset = avg_dispersion * (vframe.format.width as isize) * y_delta as isize + avg_dispersion * x_delta;
-        //             let idx = (pixel_idx as isize + offset) as usize;
-
-        //             // x delta might slip over a line boundary
-        //             // this prevents pixels at the beginning/end of the adjacent lines from being included
-        //             let offset_y = (pixel_y as isize + avg_dispersion * y_delta) as usize;
-        //             let actual_y = idx / x_size;
-        //             // println!("pix_idx: {}, x_delta: {}, y_delta: {}, offset: {}, idx: {}", pixel_idx, x_delta, y_delta, offset, idx);
-        //             // println!("offset_y: {}, actual_y: {}", offset_y, actual_y);
-        //             if idx > 0 && ((idx as usize) < pixel_len) && offset_y == actual_y {
-        //                 us += Self::to_f64(vframe.data[4*idx+2]);
-        //                 vs += Self::to_f64(vframe.data[4*idx+3]);
-        //             }
-        //         }
-        //     }
-
-        //     let u_final = us / smooth_area as f64;
-        //     let v_final = vs / smooth_area as f64;
-
-        //     vframe.data[4*pixel_idx+2] = Self::to_u8(u_final);
-        //     vframe.data[4*pixel_idx+3] = Self::to_u8(v_final);
-        // }
     }
 }

@@ -31,7 +31,7 @@ extern crate apodize;
 extern crate num_complex;
 extern crate stats;
 extern crate glib;
-
+extern crate rayon;
 extern crate cpuprofiler;
 
 #[macro_use]
